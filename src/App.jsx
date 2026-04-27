@@ -1,16 +1,16 @@
 import { useState, useEffect, useRef, useMemo } from "react";
 
 // ════════════════════════════════════════════════════════════
-// OAHU SFR DIGITAL TWIN — v2.3
-// JavaScript port of oahu_sfr_model_v2.py
+// OAHU SFR DIGITAL TWIN — v3.0
+// JavaScript port of oahu_sfr_model_v3.py
 //
-// Key modelling decisions (v2.1+ revisions):
+// Key modelling decisions (matches Python v3):
 //  1. Virtual-inertia accounting — GFM virtual inertia is realised
 //     only as a power injection (dp_inertia in GFM respond()), NOT
 //     added to H_eff.  Adding it to both would double-count.
-//  2. Solar-ramp offset targeting — ibr_power_scale_offset is
-//     applied only to PV (non-GFM) fleet output so that BESS
-//     responds independently of cloud cover.
+//  2. Solar-ramp offset targeting — ibrOffset is applied only to
+//     PV (non-GFM) fleet output so that BESS responds independently
+//     of cloud cover.
 //  3. Spinning-reserve / headroom — the governor clips its valve
 //     reference to available headroom (cap − baseLoad) and p_sync
 //     is clamped to [0, syncOnlineMW].
@@ -18,6 +18,16 @@ import { useState, useEffect, useRef, useMemo } from "react";
 //     Pre-BESS eras carry full ~208 MW reserve on sync; BESS eras
 //     offload most reserve to the BESS, allowing sync ≈ 50-60 MW
 //     above base loading.
+//  5. Adaptive AGC dispatch (v3): the 70/30 BESS/sync participation
+//     split is applied only when a GFM BESS is online and not
+//     tripped.  In all-synchronous eras (or after a BESS outage)
+//     100% of the AGC signal flows to the synchronous fleet, so
+//     Era 1 recovers to nominal frequency rather than settling at
+//     a primary-droop offset.
+//  6. Legacy 1547-2003 inverter clearing (v3): the default model is
+//     'fixed' — the IEEE 1547-2003 literal must-trip-within-160-ms
+//     requirement at f ≤ 59.3 Hz.  'depth_scaled' surrogate is
+//     retained for sensitivity studies.
 // ════════════════════════════════════════════════════════════
 const F0 = 60.0, SB = 1800.0, HS = 4.0, DROOP_SYNC = 0.05;
 const GOV_DEADBAND = 0.036;
@@ -36,15 +46,26 @@ const AGC_DEADBAND = 0.02, AGC_BESS_PART = 0.70, AGC_SYNC_PART = 0.30;
 // ════════════════════════════════════════════════════════════
 // INVERTER CLASSES (matching v2 Python model)
 // ════════════════════════════════════════════════════════════
-function mkLeg(c) {
+// Legacy IEEE 1547-2003 inverter.  Two clearing-time models:
+//   'fixed'        — must trip within 160 ms whenever f ≤ 59.3 Hz
+//                    (literal IEEE 1547-2003 standard text; default).
+//   'depth_scaled' — modeling surrogate t = max(0.16 * 0.1 / depth,
+//                    0.05) s, retained for sensitivity studies.
+function mkLeg(c, clearingModel = "fixed") {
   return {
-    t: "leg", c, tripped: false, power: 0, timer: 0,
+    t: "leg", c, tripped: false, power: 0, timer: 0, clearingModel,
     init(d = 0.7) { this.tripped = false; this.timer = 0; this.power = c * d; return this.power; },
     respond(f, dfdt, dt) {
       if (this.tripped) return 0;
       if (f <= 59.3) {
-        const depth = Math.max(59.3 - f, 0.01);
-        const thresh = Math.max(0.16 * 0.1 / depth, 0.05);
+        let thresh;
+        if (this.clearingModel === "depth_scaled") {
+          const depth = Math.max(59.3 - f, 0.01);
+          thresh = Math.max(0.16 * 0.1 / depth, 0.05);
+        } else {
+          // 'fixed' — IEEE 1547-2003 literal text
+          thresh = 0.16;
+        }
         this.timer += dt;
         if (this.timer >= thresh) { this.tripped = true; return 0; }
       } else { this.timer = Math.max(0, this.timer - dt); }
@@ -214,7 +235,12 @@ function simulate({ syncMW, fleets, pLoad, contingency, tEnd = 60, dt = 0.002 })
     contingency.apply(t, dt, st);
     pSyncBase = st.pSyncBase; HSys = st.HSys;
 
+    // Adaptive AGC dispatch (matches Python v3):
+    //   has_active_bess  -> 70/30 BESS/sync split (HECO preference)
+    //   no active BESS   -> 100% to sync, so the integral term can
+    //                       fully erase the primary-droop offset.
     let bessAgc = 0, syncAgc = 0;
+    const hasActiveBess = (gfmFleet !== null) && (!gfmFleet.tripped);
     if (t > contingency.tripTime + 2.0) {
       const dF = freq - F0;
       if (Math.abs(dF) > AGC_DEADBAND) agcIntegral += dF * dt;
@@ -224,7 +250,13 @@ function simulate({ syncMW, fleets, pLoad, contingency, tEnd = 60, dt = 0.002 })
         agcTotal = Math.abs(dF) <= AGC_DEADBAND ? agcTotal * 0.95 : AGC_KP * (-dF) + AGC_KI * (-agcIntegral);
         agcTotal = Math.max(-300, Math.min(300, agcTotal));
       }
-      bessAgc = agcTotal * AGC_BESS_PART; syncAgc = agcTotal * AGC_SYNC_PART;
+      if (hasActiveBess) {
+        bessAgc = agcTotal * AGC_BESS_PART;
+        syncAgc = agcTotal * AGC_SYNC_PART;
+      } else {
+        bessAgc = 0;
+        syncAgc = agcTotal;
+      }
       governor.setAgc(syncAgc);
       for (const fl of fleets) { if (fl.t === "gfm") fl.setAgc(bessAgc); }
     }
@@ -258,8 +290,15 @@ function simulate({ syncMW, fleets, pLoad, contingency, tEnd = 60, dt = 0.002 })
     fA[i] = freq; rA[i] = dfdt; psA[i] = pSync; piA[i] = pIbr;
     socA[i] = gfmFleet ? gfmFleet.soc : 0; pLoadA[i] = pLA;
   }
+  // Headline metrics (matches Python compute_metrics):
+  //   nadir       = min(f) over the whole run
+  //   peak ROCOF  = max(|df/dt|) for all t > tripTime (covers the
+  //                 first AND any later events in a compound scenario)
   let nadir = F0, nT = 0, mR = 0;
-  for (let i = 0; i < N; i++) { if (fA[i] < nadir) { nadir = fA[i]; nT = tA[i]; } if (tA[i] > 1 && tA[i] < 5 && Math.abs(rA[i]) > mR) mR = Math.abs(rA[i]); }
+  for (let i = 0; i < N; i++) {
+    if (fA[i] < nadir) { nadir = fA[i]; nT = tA[i]; }
+    if (tA[i] > contingency.tripTime && Math.abs(rA[i]) > mR) mR = Math.abs(rA[i]);
+  }
   return { tA, fA, rA, psA, piA, socA, pLoadA, N, nadir, nT, mR, ss: fA[N - 1] };
 }
 
@@ -346,8 +385,9 @@ const SCENARIOS = [
   { id: "i_med",      cat: "ibr",   label: "Moderate DER dropout",  sub: "50 MW IBR sympathetic trip",                icon: "\uD83D\uDD0C", color: "#d62728", tEnd: 60,  make: () => makeIBRTrip(50) },
   { id: "i_large",    cat: "ibr",   label: "Large DER dropout",     sub: "100 MW (Blue Cut Fire-scale)",              icon: "\uD83D\uDD0C", color: "#d62728", tEnd: 90,  make: () => makeIBRTrip(100) },
   { id: "b_out",      cat: "bess",  label: "BESS forced outage",    sub: "GFM BESS trips \u2014 loss of virtual inertia", icon: "\uD83D\uDD0B", color: "#4facfe", tEnd: 90,  make: () => makeBESSOutage() },
-  { id: "c_mod",      cat: "compound", label: "Cloud \u2192 Kahe trip",     sub: "60 MW ramp then 90 MW sync trip at 30 s",   icon: "\u26D3", color: "#bb86fc", tEnd: 120, make: () => makeCompound([makeSolarRamp(60, 30, 1), makeSyncTrip(90, 30)]) },
-  { id: "c_sev",      cat: "compound", label: "Storm \u2192 Kalaeloa trip", sub: "100 MW ramp then 208 MW trip at 25 s",      icon: "\u26D3", color: "#bb86fc", tEnd: 120, make: () => makeCompound([makeSolarRamp(100, 25, 1), makeSyncTrip(208, 25)]) },
+  { id: "c_mod",      cat: "compound", label: "Cloud \u2192 Kahe trip",     sub: "60 MW ramp / 45 s, then Kahe (90 MW) at 30 s",   icon: "\u26D3", color: "#bb86fc", tEnd: 120, make: () => makeCompound([makeSolarRamp(60, 45, 1), makeSyncTrip(90, 30)]) },
+  { id: "c_sev",      cat: "compound", label: "Storm \u2192 Kalaeloa trip", sub: "100 MW ramp / 30 s, then Kalaeloa (208 MW) at 25 s",      icon: "\u26D3", color: "#bb86fc", tEnd: 120, make: () => makeCompound([makeSolarRamp(100, 30, 1), makeSyncTrip(208, 25)]) },
+  { id: "c_bess_kahe", cat: "compound", label: "BESS outage → Kahe",    sub: "GFM BESS trips, Kahe (90 MW) lost 14 s later",   icon: "⛓", color: "#bb86fc", tEnd: 90,  make: () => makeCompound([makeBESSOutage(1), makeSyncTrip(90, 15)]) },
 ];
 
 const CATS = [
@@ -512,7 +552,7 @@ export default function App() {
         <div style={{ width: 9, height: 9, borderRadius: "50%", background: isRunning ? "#ff1744" : "#00e676", boxShadow: `0 0 10px ${isRunning ? "#ff1744" : "#00e676"}`, animation: "pulse 2s infinite" }} />
         <div>
           <h1 style={{ margin: 0, fontSize: 16, fontWeight: 700, letterSpacing: 2, color: "#fff" }}>OAHU TRANSMISSION DIGITAL TWIN</h1>
-          <div style={{ fontSize: 8, color: "rgba(255,255,255,0.22)", letterSpacing: 3, marginTop: 1 }}>HECO 138 kV · CONTINGENCY FRAMEWORK v2.1 · ELEN 4510</div>
+          <div style={{ fontSize: 8, color: "rgba(255,255,255,0.22)", letterSpacing: 3, marginTop: 1 }}>HECO 138 kV · SFR FRAMEWORK v3.0 · ELEN 4510</div>
         </div>
         <div style={{ marginLeft: "auto", textAlign: "right" }}>
           <div style={{ fontSize: 26, fontWeight: 700, color: fCol, fontVariantNumeric: "tabular-nums", lineHeight: 1 }}>{curFreq.toFixed(2)}</div>
