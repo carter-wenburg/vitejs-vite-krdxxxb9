@@ -551,7 +551,7 @@ export default function App() {
       <div style={{ display: "flex", alignItems: "center", gap: 14, marginBottom: 16, borderBottom: "1px solid rgba(0,230,118,0.1)", paddingBottom: 12 }}>
         <div style={{ width: 9, height: 9, borderRadius: "50%", background: isRunning ? "#ff1744" : "#00e676", boxShadow: `0 0 10px ${isRunning ? "#ff1744" : "#00e676"}`, animation: "pulse 2s infinite" }} />
         <div>
-          <h1 style={{ margin: 0, fontSize: 16, fontWeight: 700, letterSpacing: 2, color: "#fff" }}>OAHU TRANSMISSION DIGITAL TWIN</h1>
+          <h1 style={{ margin: 0, fontSize: 16, fontWeight: 700, letterSpacing: 2, color: "#fff" }}>OAHU FREQUENCY RESPONSE MODEL</h1>
           <div style={{ fontSize: 8, color: "rgba(255,255,255,0.22)", letterSpacing: 3, marginTop: 1 }}>HECO 138 kV · SFR FRAMEWORK v3.0 · ELEN 4510</div>
         </div>
         <div style={{ marginLeft: "auto", textAlign: "right" }}>
